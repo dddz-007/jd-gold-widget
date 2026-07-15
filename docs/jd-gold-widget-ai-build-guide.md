@@ -1,195 +1,207 @@
 # JD Gold Widget AI 构建指南
 
-本文档可直接发给 AI 编程助手，让其快速复刻、定制或移植 `jd-gold-widget` 桌面挂件。
+本文档描述**当前仓库已实现**的架构与约定，可直接发给 AI 编程助手，用于复刻、定制、修 bug 或移植。
 
-## 这个插件是什么
+> 仓库：`jd-gold-widget`。主平台为 **Windows 10/11**；以下行为以现有 Python 实现为准。
 
-构建一个轻量级桌面挂件，用于显示：
+## 这个应用是什么
+
+轻量级 Windows 桌面挂件，显示：
 
 - 伦敦金价格 `USD/oz`
 - 换算后的人民币金价 `CNY/g`
-- 数据来源页面：`https://gold-price-pro.pf.jd.com/`
+- 数据来源：`https://gold-price-pro.pf.jd.com/`
 
-挂件应当：
+已实现能力：
 
-- 悬浮在桌面最上层
-- 无边框
-- 可拖拽
-- 记住窗口位置
-- 自动刷新
-- 双击或菜单操作可打开京东金价页面
-- 支持开机自启动
-- 避免生成大量随机 Chrome profile 目录
-- 复用一个稳定的浏览器 profile；仅在必要时使用一个固定的备用 session profile
+- 无边框、置顶、可拖拽，重启后记住位置
+- 自动刷新（页面 DOM mutation observer + 挂件侧轮询）
+- 双击打开京东金价页；右键菜单可开自启 / 关自启 / 退出
+- GUI 单实例（Windows mutex）
+- 首次启动 GUI 时默认写入开机自启（可用 `JD_GOLD_SKIP_AUTO_STARTUP=1` 跳过；CLI 入口已设置该变量）
+- 稳定 Chromium user-data 目录；占用时回退到固定备用 session，不创建随机 profile
+- PyInstaller 单文件 `exe`：`JDGoldWidget.exe`（窗口）+ `JDGoldWidgetCli.exe`（控制台）
+- 用户通过 **GitHub Releases** 下载 exe 使用；源码仓库不提交构建产物
 
-## 当前推荐架构
+## 当前架构（实现真相）
 
-使用 Python + Tkinter + Chromium DevTools Protocol。
+技术栈：
 
-推荐技术栈：
+| 层 | 技术 |
+| --- | --- |
+| UI | Python 3.10+ + `tkinter`；Windows 色键透明（`-transparentcolor`）+ 近透明 hit overlay 接收鼠标 |
+| 采价 | 隐藏 Chromium 远程调试 + DevTools WebSocket（`websocket-client`） |
+| 数据目录 | `%LOCALAPPDATA%\JDGoldWidget`（位置 JSON、Chrome profile，不写项目目录） |
+| 自启 | 用户 Startup 文件夹中的 `.vbs` 脚本 |
+| 打包 | PyInstaller onefile → `dist\`；`scripts/build_windows.ps1`；tag `v*` 触发 GitHub Actions Release |
 
-- Python `3.10+`
-- `tkinter` 负责挂件 UI
-- `websocket-client` 负责 DevTools WebSocket 通信
-- 基于 Chromium 的浏览器负责隐藏页面渲染：
-  - Google Chrome
-  - Microsoft Edge
-  - Chromium
-  - Brave
+核心模块：
 
-## 行为要求
+| 文件 | 职责 |
+| --- | --- |
+| `gold_widget_app.py` | 全部业务：浏览器发现/启动、CDP 读价、挂件 UI、自启、CLI 标志、单实例 |
+| `gold_widget.pyw` | GUI 入口（无控制台） |
+| `gold_widget_cli.py` | CLI 入口（设 `JD_GOLD_SKIP_AUTO_STARTUP`，调用 `main(allow_gui=False)`） |
 
-请严格实现以下功能：
+运行时路径常量（以代码为准）：
 
-1. 应用启动一个启用远程调试的隐藏 Chromium 浏览器。
-2. 应用打开 `https://gold-price-pro.pf.jd.com/`。
-3. 应用从以下 DOM 节点读取数值：
+- `APP_DIR` = `%LOCALAPPDATA%\JDGoldWidget`
+- `widget_position.json`
+- `jd-gold-chrome-profile`（主）
+- `jd-gold-chrome-session`（备用；退出时可清理）
+- Startup 脚本：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\JD Gold Widget AutoStart.vbs`
+
+## 行为要求（须保持）
+
+1. 启动启用远程调试的隐藏 Chromium，打开 `https://gold-price-pro.pf.jd.com/`。
+2. 从 DOM 读取：
    - `.main-price-row .main-price-item .main-value`
    - `.update-time`
-4. 应用在页面中安装 DOM observer，仅在数值变化时更新挂件。
-5. 应用窗口必须保持置顶。
-6. 应用将窗口位置保存到本地 JSON 文件或应用数据目录。
-7. 应用支持右键菜单，包含：
-   - `打开京东金价页面`
-   - `启用开机自启动`
-   - `关闭开机自启动`
-   - `退出`
-8. 应用支持以下 CLI 命令：
+3. 页面内安装 mutation observer，数值变化时再推送给挂件。
+4. 窗口置顶；位置持久化到 `APP_DIR`。
+5. 右键菜单：打开京东金价页面 / 启用开机自启动 / 关闭开机自启动 / 退出。
+6. CLI（打包体为 `JDGoldWidgetCli.exe`；源码为 `gold_widget_cli.py`）：
    - `--once`
    - `--startup-status`
    - `--enable-startup`
    - `--disable-startup`
    - `--runtime-check`
+7. GUI 单实例；二次启动短生命周期 CLI 在主 profile 被占用时应回退固定备用 profile。
+8. 启动时可清理残留隐藏浏览器进程与陈旧 `jd-gold-chrome-*` 目录（保留当前活动 profile）。
 
-## Windows 兼容性目标
+## Windows 兼容性（现有策略）
 
-目标环境：主流受支持的 Windows 桌面系统，尤其是 Windows 10 和 Windows 11。
+浏览器查找顺序覆盖：
 
-为尽量提高兼容性：
+- 环境变量：`JD_GOLD_BROWSER` / `CHROME_PATH` / `GOOGLE_CHROME_BIN`
+- 常见 `Program Files` / `Program Files (x86)` 路径
+- `%LOCALAPPDATA%` 下用户安装路径
+- 注册表 `App Paths`（`chrome.exe` / `msedge.exe` / `brave.exe`）
+- `PATH` 中的 `chrome` / `msedge` / `brave` / `chromium`
 
-- 在以下位置搜索浏览器可执行文件：
-  - `Program Files`
-  - `Program Files (x86)`
-  - `LOCALAPPDATA`
-  - Windows 注册表 `App Paths`
-  - `PATH`
-- 支持这些浏览器二进制文件：
-  - `chrome.exe`
-  - `msedge.exe`
-  - `brave.exe`
-  - `chromium.exe`
-- 支持环境变量覆盖：
-  - `JD_GOLD_BROWSER`
-  - `CHROME_PATH`
-  - `GOOGLE_CHROME_BIN`
-- 启动无头模式时优先尝试：
-  - `--headless=new`
-  - 不兼容时回退到 `--headless --disable-gpu`
-- 使用稳定的主 profile 目录，例如：
-  - `jd-gold-chrome-profile`
-- 若主 profile 被占用，则使用一个固定备用 profile，例如：
-  - `jd-gold-chrome-session`
-- 切勿生成无限制的随机 profile 目录。
+二进制名：`chrome.exe`、`msedge.exe`、`brave.exe`、`chromium.exe`。
+
+无头启动：优先 `--headless=new`，失败再回退 `--headless --disable-gpu`。
+
+profile 规则：
+
+- 主目录固定：`jd-gold-chrome-profile`
+- 占用或不兼容：固定备用 `jd-gold-chrome-session`
+- **禁止**无限制随机 profile 目录
 
 ## 自启动策略
 
-### Windows
+### Windows（当前实现）
 
-可优先采用以下任一方式：
+Startup 文件夹中的 VBS，启动打包后的 GUI exe 或源码入口。注册表 `Run` 键不是当前默认，但可接受为备选。
 
-- 用户 Startup 文件夹脚本
-- `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+### macOS（移植目标，仓库尚未实现）
 
-使用 Startup 文件夹实现更易维护，也可以接受。
+使用 `~/Library/LaunchAgents/` 下 LaunchAgent plist。
 
-### macOS
+## macOS 移植要点
 
-使用 LaunchAgent plist，路径位于：
+保持相同行为，替换平台细节：
 
-- `~/Library/LaunchAgents/`
-
-## macOS 移植要求
-
-如果要重建为 macOS 版本，请保持相同行为，但调整这些细节：
-
-- 浏览器路径发现应包含：
-  - `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
-  - `/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge`
-  - `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser`
-  - `/Applications/Chromium.app/Contents/MacOS/Chromium`
-- 自启动应使用 LaunchAgent，而不是 Windows Startup 文件夹
-- 右键行为可能需要同时支持这两种 Tk 事件：
-  - `<Button-2>`
-  - `<Button-3>`
-- 打包可采用：
-  - `py2app`
-  - `PyInstaller`
+- 浏览器路径：`/Applications` 下 Chrome / Edge / Brave / Chromium
+- 自启：LaunchAgent，不是 Windows Startup
+- 右键同时绑定 `<Button-2>` / `<Button-3>`
+- 打包：`py2app` 或 PyInstaller
+- 运行时数据：宜用 `~/Library/Application Support/JDGoldWidget` 一类目录，勿写源码树
 
 ## 个人定制扩展点
 
-在设计代码时，应便于做这些定制：
+设计上应便于：
 
-- 更换数据源 URL
-- 增加更多价格或符号
-- 根据涨跌改变颜色
-- 增加精简模式和完整模式
-- 增加刷新间隔设置
-- 增加点击穿透模式
-- 增加系统托盘或菜单栏模式
-- 增加价格提醒阈值
-- 增加日志与诊断模式
-- 增加导出为 JSON 或 CSV
+- 更换数据源 URL / 选择器
+- 更多价格或符号；涨跌变色
+- 精简 / 完整模式；刷新间隔
+- 点击穿透；系统托盘
+- 价格提醒；诊断日志；导出 JSON/CSV
 
 ## 工程规范
 
-- 将代码保持在一个小模块，或非常少的一组模块中。
-- 对 URL、颜色、超时、选择器和路径使用明确常量。
-- 让浏览器启动逻辑与 UI 入口分离。
-- 让运行时检查可从 CLI 调用。
-- 找不到兼容浏览器时，给出可读的错误信息。
-- 退出时清理备用 session profile。
-- 不要静默创建大量临时目录。
-- 为挂件主进程保留稳定的主 profile。
+- 逻辑集中在少量模块（当前以 `gold_widget_app.py` 为主）。
+- URL、颜色、超时、选择器、路径用明确常量。
+- 浏览器启动与 UI 入口分离（`.pyw` / CLI 薄包装）。
+- 找不到浏览器时给出可读错误；`--runtime-check` 可诊断路径与自启状态。
+- 退出时清理备用 session profile；保留稳定主 profile。
+- 运行时数据只写 `%LOCALAPPDATA%\JDGoldWidget`（或目标平台等效目录）。
+- 构建产物仅出现在 `build/`、`dist/`、`*.spec`，由 `.gitignore` 忽略，**不提交 Git**；对外分发走 GitHub Releases。
+
+## 打包与分发（当前约定）
+
+本地：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
+```
+
+产物：
+
+- `dist\JDGoldWidget.exe`（`--windowed`）
+- `dist\JDGoldWidgetCli.exe`（`--console`）
+
+发版：
+
+1. **推荐**：推送 `v*` tag → `.github/workflows/release.yml` 自动构建并上传上述两个 exe 到 Releases
+2. **手动**：把 `dist\` 下两个 exe 作为 Release Assets 上传（步骤见 `docs/releasing.md`）
+
+不要把 exe 放进仓库根目录或提交进 Git。
 
 ## 验收标准
 
-只有满足以下全部条件，才算构建完成：
+全部满足才算完成：
 
-1. 启动挂件后，能看到显示实时金价的置顶悬浮窗。
-2. 双击可打开京东金价页面。
-3. 右键可打开可用的操作菜单。
-4. 重启后窗口位置仍会保留。
-5. 可以启用和关闭开机自启动。
-6. `--once` 能输出包含价格字段的有效 JSON。
-7. `--runtime-check` 能输出浏览器路径、自启动状态和 profile 目录信息。
-8. 多次启动不会生成大量随机 `jd-gold-chrome-*` 目录。
-9. 若已有挂件实例占用主浏览器 profile，第二次短生命周期运行可以回退到固定备用 profile。
+1. 挂件置顶显示实时金价。
+2. 双击打开京东金价页；右键菜单可用。
+3. 重启后窗口位置保留。
+4. 可启用 / 关闭开机自启。
+5. `--once` 输出含价格字段的有效 JSON。
+6. `--runtime-check` 输出浏览器路径、自启状态、profile 目录。
+7. 多次启动不产生大量随机 `jd-gold-chrome-*` 目录。
+8. 主 profile 被占用时，短生命周期运行可回退固定备用 profile。
+9. 本地打包产物位于 `dist\`；用户可从 GitHub Releases 下载 `JDGoldWidget.exe` 直接使用。
 
-## 建议文件结构
+## 建议文件结构（与仓库一致）
 
 ```text
-project/
+jd-gold-widget/
   README.md
   requirements.txt
   requirements-dev.txt
+  .gitignore
   gold_widget_app.py
   gold_widget.pyw
   gold_widget_cli.py
   docs/
     jd-gold-widget-ai-build-guide.md
+    releasing.md
   scripts/
     build_windows.ps1
+  .github/
+    workflows/
+      release.yml
 ```
 
-## 建议依赖
+本地打包后会出现（不入库）：
 
-`requirements.txt`
+```text
+  build/
+  dist/
+  *.spec
+```
+
+## 依赖
+
+`requirements.txt`：
 
 ```text
 websocket-client>=1.8
 ```
 
-`requirements-dev.txt`
+`requirements-dev.txt`：
 
 ```text
 pyinstaller>=6.21
@@ -198,33 +210,28 @@ pyinstaller>=6.21
 ## 可直接复制给 AI 的提示词
 
 ```text
-请使用 Python 和 Tkinter 构建一个名为“JD Gold Widget”的桌面挂件。
+请基于现有 jd-gold-widget 仓库约定，用 Python + Tkinter 实现或修改 Windows 桌面挂件 “JD Gold Widget”。
 
-需求：
-- 显示伦敦金价格（USD/oz）和换算后的人民币金价（CNY/g）
+已实现/必须对齐的需求：
+- 显示伦敦金 USD/oz 与换算人民币 CNY/g
 - 数据来源：https://gold-price-pro.pf.jd.com/
-- 启动一个启用远程调试的隐藏 Chromium 浏览器
-- 从渲染后的 DOM 中读取价格
-- 在页面中安装 mutation observer，仅在数值变化时更新
-- 无边框、可拖拽、置顶窗口
-- 将挂件位置持久化到应用数据目录
-- 双击打开来源页面
-- 右键菜单：打开京东金价页面 / 启用开机自启动 / 关闭开机自启动 / 退出
-- CLI 命令：--once、--startup-status、--enable-startup、--disable-startup、--runtime-check
-- 浏览器发现必须支持 Chrome、Edge、Chromium 和 Brave
-- 浏览器查找必须覆盖 Program Files、Program Files (x86)、LOCALAPPDATA、PATH 以及 Windows App Paths 注册表
-- 支持环境变量覆盖：JD_GOLD_BROWSER、CHROME_PATH、GOOGLE_CHROME_BIN
-- 优先尝试 --headless=new，然后回退到 --headless --disable-gpu
-- 复用名为 jd-gold-chrome-profile 的稳定浏览器 profile 目录
-- 若该 profile 被占用，回退到固定备用 profile：jd-gold-chrome-session
-- 切勿创建大量随机临时 profile 目录
-- 增加 Windows 开机自启动
-- 保持实现尽量小、可读，并具备可上线使用的稳健性
+- 隐藏 Chromium + 远程调试 + DevTools WebSocket 读 DOM
+- 页面 mutation observer，仅数值变化时更新
+- 无边框、可拖拽、置顶；Windows 色键透明 + hit overlay
+- 位置与 Chrome profile 写入 %LOCALAPPDATA%\JDGoldWidget
+- 主 profile：jd-gold-chrome-profile；占用时固定备用：jd-gold-chrome-session；禁止随机临时 profile
+- 双击打开来源页；右键：打开页面 / 启停开机自启 / 退出
+- GUI 单实例（mutex）；首次 GUI 启动默认可写入 Startup 文件夹 VBS（JD_GOLD_SKIP_AUTO_STARTUP=1 可跳过）
+- CLI：--once、--startup-status、--enable-startup、--disable-startup、--runtime-check
+- 浏览器发现：Chrome/Edge/Brave/Chromium；环境变量 JD_GOLD_BROWSER、CHROME_PATH、GOOGLE_CHROME_BIN；覆盖 Program Files、LOCALAPPDATA、App Paths、PATH
+- headless 优先 --headless=new，再回退 --headless --disable-gpu
+- 入口：gold_widget.pyw（GUI）、gold_widget_cli.py（CLI）、逻辑集中在 gold_widget_app.py
+- 打包：scripts/build_windows.ps1 → 仅输出到 dist/；CI 在 tag v* 时把 dist 下 exe 发到 GitHub Releases；构建产物不入库
 
-如果改为面向 macOS 而不是 Windows：
-- 用 LaunchAgent 替换 Windows 自启动逻辑
-- 增加 macOS 浏览器路径发现
-- 保持相同的挂件行为和 CLI 命令
+若改为 macOS：
+- LaunchAgent 替换 Startup VBS
+- 增加 macOS 浏览器路径与 Application Support 数据目录
+- 保持相同挂件行为与 CLI 命令
 
-请返回代码、简短 README，以及打包说明。
+请返回最小必要改动的代码、简短 README，以及打包说明。
 ```

@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import messagebox
 import urllib.error
 import urllib.request
@@ -43,15 +45,30 @@ STARTUP_SCRIPT_PATH = (
     / "JD Gold Widget AutoStart.vbs"
 )
 SITE_URL = "https://gold-price-pro.pf.jd.com/"
+WINDOW_TITLE = "JD Gold Widget"
+SINGLE_INSTANCE_MUTEX = "Local\\JDGoldWidget_SingleInstance"
+WINDOW_PROP_NAME = "JDGoldWidget.IsWidget"
 DEVTOOLS_TIMEOUT_SECONDS = 15
 WEBSOCKET_RECV_TIMEOUT_SECONDS = 8
 RESUME_GAP_SECONDS = 5.0
 POLL_INTERVAL_MS = 200
+ZORDER_CHECK_MS = 250
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+GW_HWNDPREV = 3
+GA_ROOT = 2
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+ERROR_ALREADY_EXISTS = 183
 TRANSPARENT_COLOR = "#010203"
+_SINGLE_INSTANCE_MUTEX_HANDLE = None
 TEXT_COLOR = "#2F3A46"
 SEPARATOR_COLOR = "#556270"
 WINDOW_PADDING_X = 16
 WINDOW_PADDING_Y = 10
+HIT_OVERLAY_ALPHA = 0.01  # Receives mouse; nearly invisible over the chroma-keyed text window.
 DEFAULT_Y = 42
 BROWSER_ENV_VARS = ("JD_GOLD_BROWSER", "CHROME_PATH", "GOOGLE_CHROME_BIN")
 SKIP_AUTO_STARTUP_ENV = "JD_GOLD_SKIP_AUTO_STARTUP"
@@ -86,6 +103,124 @@ PATH_BROWSER_NAMES = (
     "brave",
     "chromium",
 )
+
+
+def _user32():
+    return ctypes.windll.user32
+
+
+def _kernel32():
+    return ctypes.windll.kernel32
+
+
+def _tk_hwnd(widget: tk.Misc) -> int:
+    """Return the real top-level HWND (TkTopLevel), not the child from winfo_id()."""
+    hwnd = int(widget.winfo_id())
+    if sys.platform != "win32":
+        return hwnd
+    top = int(_user32().GetAncestor(hwnd, GA_ROOT) or 0)
+    return top or hwnd
+
+
+def _ensure_ex_topmost(hwnd: int) -> None:
+    style = int(_user32().GetWindowLongW(hwnd, GWL_EXSTYLE))
+    if style & WS_EX_TOPMOST:
+        return
+    _user32().SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TOPMOST)
+
+
+def _taskbar_hwnds() -> list[int]:
+    user32 = _user32()
+    found: list[int] = []
+    primary = int(user32.FindWindowW("Shell_TrayWnd", None) or 0)
+    if primary:
+        found.append(primary)
+    secondary = int(user32.FindWindowW("Shell_SecondaryTrayWnd", None) or 0)
+    if secondary:
+        found.append(secondary)
+    return found
+
+
+def _hwnd_is_behind_taskbar(hwnd: int) -> bool:
+    """True when any taskbar top-level window is above hwnd in EnumWindows z-order."""
+    return _top_covering_taskbar(hwnd) is not None
+
+
+def _top_covering_taskbar(hwnd: int) -> int | None:
+    """Return the highest taskbar HWND currently above hwnd, if any."""
+    trays = {tray for tray in _taskbar_hwnds() if tray}
+    if not trays:
+        return None
+
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(enum_hwnd, _lparam):
+        current = int(enum_hwnd)
+        if current == hwnd:
+            return False
+        if current in trays:
+            found.append(current)
+            return False
+        return True
+
+    _user32().EnumWindows(_enum, 0)
+    return found[0] if found else None
+
+
+def _set_hwnd_topmost(hwnd: int, *, force_restack: bool = False) -> None:
+    """Keep hwnd TOPMOST. force_restack re-inserts it above the taskbar when demoted."""
+    user32 = _user32()
+    _ensure_ex_topmost(hwnd)
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    if force_restack:
+        # HWND_TOPMOST alone does not reclaim order after the taskbar jumps ahead
+        # inside the TOPMOST band. Insert immediately above the covering taskbar.
+        tray = _top_covering_taskbar(hwnd)
+        if tray:
+            prev = int(user32.GetWindow(tray, GW_HWNDPREV) or 0)
+            insert_after = prev if prev and prev != hwnd else HWND_TOPMOST
+            user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+
+
+def _activate_existing_gui() -> None:
+    matches: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):
+        if _user32().GetPropW(hwnd, WINDOW_PROP_NAME):
+            matches.append(int(hwnd))
+            return False
+        return True
+
+    _user32().EnumWindows(_enum, 0)
+    hwnd = matches[0] if matches else int(_user32().FindWindowW(None, WINDOW_TITLE) or 0)
+    if not hwnd:
+        return
+    _set_hwnd_topmost(hwnd)
+    _user32().ShowWindow(hwnd, 5)  # SW_SHOW
+
+
+def ensure_single_gui_instance() -> bool:
+    """Keep only one GUI process. Return False if another instance already owns the lock."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+
+    if sys.platform != "win32":
+        return True
+
+    _kernel32().SetLastError(0)
+    handle = _kernel32().CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        return True
+
+    if _kernel32().GetLastError() == ERROR_ALREADY_EXISTS:
+        _kernel32().CloseHandle(handle)
+        _activate_existing_gui()
+        return False
+
+    _SINGLE_INSTANCE_MUTEX_HANDLE = handle
+    return True
 
 
 @dataclass
@@ -657,16 +792,21 @@ class GoldWidgetApp:
 
         self.london_var = tk.StringVar(value="----.--")
         self.cny_var = tk.StringVar(value="----.--")
+        self._hwnd: int | None = None
+        self._overlay_hwnd: int | None = None
+        self.hit_overlay: tk.Toplevel | None = None
+        self._zorder_job: str | None = None
 
         self._build_window()
         self._build_layout()
+        self._build_hit_overlay()
         self._configure_context_menu()
 
         self.root.after(250, self.refresh_async)
         self.root.after(POLL_INTERVAL_MS, self._schedule_refresh)
 
     def _build_window(self) -> None:
-        self.root.title("JD Gold Widget")
+        self.root.title(WINDOW_TITLE)
         self.root.overrideredirect(True)
         self.root.configure(bg=TRANSPARENT_COLOR)
         self.root.attributes("-topmost", True)
@@ -681,16 +821,160 @@ class GoldWidgetApp:
         except tk.TclError:
             pass
 
+        # transparentcolor can reshuffle styles; re-assert topmost afterwards.
+        self.root.attributes("-topmost", True)
+
         screen_width = self.root.winfo_screenwidth()
         x, y = load_position(screen_width)
         self.root.geometry(f"+{x}+{y}")
 
-        self.root.bind("<ButtonPress-1>", self._start_drag)
-        self.root.bind("<B1-Motion>", self._drag_window)
-        self.root.bind("<ButtonRelease-1>", self._finish_drag)
-        self.root.bind("<Double-Button-1>", self._open_site)
-        self.root.bind("<Button-3>", self._show_context_menu)
         self.root.bind("<Escape>", lambda _event: self.shutdown())
+        self.root.bind("<Configure>", self._on_root_configure)
+        self.root.after(0, self._install_zorder_guard)
+
+    def _raise_widget_stack(self, *, force_restack: bool = False) -> None:
+        """Raise text window, then hit overlay. Order matters for click targeting."""
+        if sys.platform != "win32":
+            return
+        try:
+            if self.root.winfo_exists():
+                self._hwnd = _tk_hwnd(self.root)
+            if self.hit_overlay is not None and self.hit_overlay.winfo_exists():
+                self._overlay_hwnd = _tk_hwnd(self.hit_overlay)
+            if self._hwnd:
+                _set_hwnd_topmost(self._hwnd, force_restack=force_restack)
+            if self._overlay_hwnd:
+                if force_restack and self._hwnd:
+                    # Park overlay immediately above the text window.
+                    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                    prev = int(_user32().GetWindow(self._hwnd, GW_HWNDPREV) or 0)
+                    insert_after = (
+                        prev
+                        if prev and prev != self._overlay_hwnd
+                        else HWND_TOPMOST
+                    )
+                    _ensure_ex_topmost(self._overlay_hwnd)
+                    _user32().SetWindowPos(
+                        self._overlay_hwnd,
+                        insert_after,
+                        0,
+                        0,
+                        0,
+                        0,
+                        flags,
+                    )
+                _set_hwnd_topmost(self._overlay_hwnd, force_restack=False)
+        except tk.TclError:
+            pass
+
+    def _needs_zorder_fix(self) -> bool:
+        if sys.platform != "win32" or not self._hwnd:
+            return False
+        if _hwnd_is_behind_taskbar(self._hwnd):
+            return True
+        if self._overlay_hwnd and _hwnd_is_behind_taskbar(self._overlay_hwnd):
+            return True
+        return False
+
+    def _repair_zorder_if_needed(self) -> None:
+        # Only restack when we are actually under the taskbar.
+        if not self._needs_zorder_fix():
+            return
+        self._raise_widget_stack(force_restack=True)
+
+    def _install_zorder_guard(self) -> None:
+        try:
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            return
+
+        if sys.platform != "win32":
+            return
+
+        try:
+            self._hwnd = _tk_hwnd(self.root)
+            _user32().SetPropW(self._hwnd, WINDOW_PROP_NAME, 1)
+            self._raise_widget_stack()
+            self._schedule_zorder_check()
+            self.root.after(0, self._sync_hit_overlay)
+        except Exception:
+            self._hwnd = None
+
+    def _schedule_zorder_check(self) -> None:
+        self._repair_zorder_if_needed()
+        try:
+            self._zorder_job = self.root.after(ZORDER_CHECK_MS, self._schedule_zorder_check)
+        except tk.TclError:
+            self._zorder_job = None
+
+    def _remove_zorder_guard(self) -> None:
+        if self._zorder_job is not None:
+            try:
+                self.root.after_cancel(self._zorder_job)
+            except tk.TclError:
+                pass
+            self._zorder_job = None
+
+        if sys.platform == "win32" and self._hwnd:
+            try:
+                _user32().RemovePropW(self._hwnd, WINDOW_PROP_NAME)
+            except Exception:
+                pass
+        self._hwnd = None
+        self._overlay_hwnd = None
+
+    def _bind_interactions(self, widget: tk.Widget) -> None:
+        widget.bind("<ButtonPress-1>", self._start_drag)
+        widget.bind("<B1-Motion>", self._drag_window)
+        widget.bind("<ButtonRelease-1>", self._finish_drag)
+        widget.bind("<Double-Button-1>", self._open_site)
+        widget.bind("<Button-3>", self._show_context_menu)
+        widget.bind("<Escape>", lambda _event: self.shutdown())
+
+    def _build_hit_overlay(self) -> None:
+        # Color-keyed transparent pixels are click-through on Windows, so a near-invisible
+        # alpha overlay sits above the text window and owns all mouse interactions.
+        overlay = tk.Toplevel(self.root)
+        overlay.withdraw()
+        overlay.overrideredirect(True)
+        overlay.configure(bg="#000000", cursor="hand2")
+        overlay.attributes("-topmost", True)
+        try:
+            overlay.attributes("-alpha", HIT_OVERLAY_ALPHA)
+        except tk.TclError:
+            overlay.attributes("-alpha", 0.05)
+        try:
+            overlay.wm_attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        overlay.attributes("-topmost", True)
+        self._bind_interactions(overlay)
+        self.hit_overlay = overlay
+        self.root.after_idle(self._sync_hit_overlay)
+
+    def _on_root_configure(self, _event: tk.Event | None = None) -> None:
+        self._sync_hit_overlay()
+
+    def _sync_hit_overlay(self) -> None:
+        overlay = self.hit_overlay
+        if overlay is None:
+            return
+        try:
+            self.root.update_idletasks()
+            width = max(self.root.winfo_width(), 1)
+            height = max(self.root.winfo_height(), 1)
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            overlay.geometry(f"{width}x{height}+{x}+{y}")
+            if not overlay.winfo_ismapped():
+                overlay.deiconify()
+            if sys.platform == "win32":
+                self._hwnd = _tk_hwnd(self.root)
+                self._overlay_hwnd = _tk_hwnd(overlay)
+            # Only raise when under the taskbar; unconditional raise causes flicker.
+            self._repair_zorder_if_needed()
+        except tk.TclError:
+            pass
 
     def _build_layout(self) -> None:
         container = tk.Frame(
@@ -713,7 +997,6 @@ class GoldWidgetApp:
             fg=SEPARATOR_COLOR,
             bg=TRANSPARENT_COLOR,
             padx=14,
-            cursor="hand2",
         )
         separator.pack(side="left")
 
@@ -726,7 +1009,6 @@ class GoldWidgetApp:
             font=("Segoe UI Semibold", 22),
             fg=TEXT_COLOR,
             bg=TRANSPARENT_COLOR,
-            cursor="hand2",
         )
 
     def _configure_context_menu(self) -> None:
@@ -795,14 +1077,15 @@ class GoldWidgetApp:
         if snapshot.london_gold_cny_text:
             self.cny_var.set(snapshot.london_gold_cny_text)
         self.root.update_idletasks()
+        self._sync_hit_overlay()
 
     def _apply_error(self, error: object) -> None:
         if self.london_var.get() not in {"----.--", "获取失败"}:
             return
         self.london_var.set("获取失败")
         self.cny_var.set("自动重试中")
-        self.root.title(f"JD Gold Widget - {error}")
         self.root.update_idletasks()
+        self._sync_hit_overlay()
 
     def _finish_refresh(self) -> None:
         self.is_refreshing = False
@@ -815,11 +1098,20 @@ class GoldWidgetApp:
         new_x = event.x_root - self.drag_start_x
         new_y = event.y_root - self.drag_start_y
         self.root.geometry(f"+{new_x}+{new_y}")
+        overlay = self.hit_overlay
+        if overlay is not None:
+            try:
+                overlay.geometry(f"+{new_x}+{new_y}")
+            except tk.TclError:
+                pass
+        self._repair_zorder_if_needed()
 
     def _finish_drag(self, _event: tk.Event) -> None:
         if self.save_position_job is not None:
             self.root.after_cancel(self.save_position_job)
         self.save_position_job = self.root.after(80, self._persist_position)
+        self._sync_hit_overlay()
+        self._raise_widget_stack()
 
     def _open_site(self, _event: tk.Event) -> None:
         webbrowser.open(SITE_URL)
@@ -848,6 +1140,7 @@ class GoldWidgetApp:
         save_position(self.root.winfo_x(), self.root.winfo_y())
 
     def shutdown(self) -> None:
+        self._remove_zorder_guard()
         self.monitor.close()
         cleanup_stale_chrome_profiles()
         try:
@@ -955,6 +1248,9 @@ def main(*, allow_gui: bool = True) -> int:
 
     if not allow_gui:
         return print_cli_usage()
+
+    if not ensure_single_gui_instance():
+        return 0
 
     cleanup_stale_chrome_profiles()
     if os.environ.get(SKIP_AUTO_STARTUP_ENV) != "1":

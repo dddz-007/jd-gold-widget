@@ -56,11 +56,14 @@ ZORDER_CHECK_MS = 250
 HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 GW_HWNDPREV = 3
 GA_ROOT = 2
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
+WS_EX_LAYERED = 0x00080000
+LWA_ALPHA = 0x00000002
 ERROR_ALREADY_EXISTS = 183
 TRANSPARENT_COLOR = "#010203"
 _SINGLE_INSTANCE_MUTEX_HANDLE = None
@@ -68,7 +71,12 @@ TEXT_COLOR = "#2F3A46"
 SEPARATOR_COLOR = "#556270"
 WINDOW_PADDING_X = 16
 WINDOW_PADDING_Y = 10
-HIT_OVERLAY_ALPHA = 0.01  # Receives mouse; nearly invisible over the chroma-keyed text window.
+# Win32 layered alpha (1/255): receives mouse; nearly invisible over the chroma-keyed text window.
+HIT_OVERLAY_ALPHA_BYTE = 1
+MAX_OVERLAY_WIDTH = 900
+MAX_OVERLAY_HEIGHT = 240
+# Park any leaked browser window far off-screen (some GPUs ignore headless).
+CHROME_OFFSCREEN_POSITION = "-32000,-32000"
 DEFAULT_Y = 42
 BROWSER_ENV_VARS = ("JD_GOLD_BROWSER", "CHROME_PATH", "GOOGLE_CHROME_BIN")
 SKIP_AUTO_STARTUP_ENV = "JD_GOLD_SKIP_AUTO_STARTUP"
@@ -127,6 +135,66 @@ def _ensure_ex_topmost(hwnd: int) -> None:
     if style & WS_EX_TOPMOST:
         return
     _user32().SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TOPMOST)
+
+
+def _set_hwnd_layered_alpha(hwnd: int, alpha_byte: int) -> bool:
+    """Apply per-pixel alpha via Win32. More reliable than Tk -alpha on some GPUs."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        user32 = _user32()
+        style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED)
+        return bool(
+            user32.SetLayeredWindowAttributes(
+                hwnd,
+                0,
+                max(1, min(int(alpha_byte), 255)),
+                LWA_ALPHA,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _measure_toplevel_size(widget: tk.Misc) -> tuple[int, int]:
+    """Return a sane overlay size; winfo_width/height can be wrong before first map."""
+    widget.update_idletasks()
+    width = int(widget.winfo_width())
+    height = int(widget.winfo_height())
+    if width <= 1 or height <= 1:
+        width = int(widget.winfo_reqwidth())
+        height = int(widget.winfo_reqheight())
+    screen_w = max(int(widget.winfo_screenwidth()), 1)
+    screen_h = max(int(widget.winfo_screenheight()), 1)
+    if width > screen_w // 2 or height > screen_h // 2:
+        width = min(int(widget.winfo_reqwidth()), MAX_OVERLAY_WIDTH)
+        height = min(int(widget.winfo_reqheight()), MAX_OVERLAY_HEIGHT)
+    width = max(1, min(width, MAX_OVERLAY_WIDTH))
+    height = max(1, min(height, MAX_OVERLAY_HEIGHT))
+    return width, height
+
+
+def _park_process_windows_offscreen(pid: int) -> None:
+    """Move visible top-level windows for a process off-screen (headless leak workaround)."""
+    if sys.platform != "win32" or pid <= 0:
+        return
+
+    user32 = _user32()
+    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):
+        window_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+        if int(window_pid.value) != pid:
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        user32.SetWindowPos(hwnd, 0, -32000, -32000, 0, 0, flags)
+        return True
+
+    user32.EnumWindows(_enum, 0)
 
 
 def _taskbar_hwnds() -> list[int]:
@@ -530,6 +598,7 @@ class ChromeDomSource:
                     for headless_args in (
                         ["--headless=new"],
                         ["--headless", "--disable-gpu"],
+                        ["--headless=old", "--disable-gpu"],
                     ):
                         try:
                             self._spawn_chrome(headless_args)
@@ -649,7 +718,10 @@ class ChromeDomSource:
             "--disable-sync",
             "--no-first-run",
             "--no-default-browser-check",
-            "--window-size=1400,1000",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--window-size=1280,720",
+            f"--window-position={CHROME_OFFSCREEN_POSITION}",
             SITE_URL,
         ]
         self.chrome_process = subprocess.Popen(
@@ -658,6 +730,9 @@ class ChromeDomSource:
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
+        if self.chrome_process is not None:
+            time.sleep(0.25)
+            _park_process_windows_offscreen(self.chrome_process.pid)
 
     def _connect(self) -> None:
         page_socket = self._wait_for_page_socket()
@@ -686,6 +761,8 @@ class ChromeDomSource:
                             return socket_url
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc
+            if self.chrome_process is not None:
+                _park_process_windows_offscreen(self.chrome_process.pid)
             time.sleep(0.25)
 
         raise RuntimeError(f"Failed to connect to hidden Chrome page: {last_error}")
@@ -795,6 +872,8 @@ class GoldWidgetApp:
         self._hwnd: int | None = None
         self._overlay_hwnd: int | None = None
         self.hit_overlay: tk.Toplevel | None = None
+        self._overlay_usable = True
+        self._content_container: tk.Widget | None = None
         self._zorder_job: str | None = None
 
         self._build_window()
@@ -933,16 +1012,13 @@ class GoldWidgetApp:
 
     def _build_hit_overlay(self) -> None:
         # Color-keyed transparent pixels are click-through on Windows, so a near-invisible
-        # alpha overlay sits above the text window and owns all mouse interactions.
+        # layered overlay sits above the text window and owns all mouse interactions.
+        # Avoid Tk -alpha here: on some GPUs/drivers it renders as a huge opaque panel.
         overlay = tk.Toplevel(self.root)
         overlay.withdraw()
         overlay.overrideredirect(True)
         overlay.configure(bg="#000000", cursor="hand2")
         overlay.attributes("-topmost", True)
-        try:
-            overlay.attributes("-alpha", HIT_OVERLAY_ALPHA)
-        except tk.TclError:
-            overlay.attributes("-alpha", 0.05)
         try:
             overlay.wm_attributes("-toolwindow", True)
         except tk.TclError:
@@ -952,6 +1028,21 @@ class GoldWidgetApp:
         self.hit_overlay = overlay
         self.root.after_idle(self._sync_hit_overlay)
 
+    def _bind_content_interactions(self) -> None:
+        container = self._content_container
+        if container is None:
+            return
+        self._bind_interactions(container)
+        for child in container.winfo_children():
+            self._bind_interactions(child)
+            for grandchild in child.winfo_children():
+                self._bind_interactions(grandchild)
+
+    def _apply_overlay_transparency(self) -> bool:
+        if sys.platform != "win32" or not self._overlay_hwnd:
+            return False
+        return _set_hwnd_layered_alpha(self._overlay_hwnd, HIT_OVERLAY_ALPHA_BYTE)
+
     def _on_root_configure(self, _event: tk.Event | None = None) -> None:
         self._sync_hit_overlay()
 
@@ -960,18 +1051,26 @@ class GoldWidgetApp:
         if overlay is None:
             return
         try:
-            self.root.update_idletasks()
-            width = max(self.root.winfo_width(), 1)
-            height = max(self.root.winfo_height(), 1)
-            x = self.root.winfo_x()
-            y = self.root.winfo_y()
+            width, height = _measure_toplevel_size(self.root)
+            x = int(self.root.winfo_x())
+            y = int(self.root.winfo_y())
             overlay.geometry(f"{width}x{height}+{x}+{y}")
-            if not overlay.winfo_ismapped():
-                overlay.deiconify()
+
             if sys.platform == "win32":
                 self._hwnd = _tk_hwnd(self.root)
                 self._overlay_hwnd = _tk_hwnd(overlay)
-            # Only raise when under the taskbar; unconditional raise causes flicker.
+                if not self._apply_overlay_transparency():
+                    if self._overlay_usable:
+                        self._overlay_usable = False
+                        overlay.withdraw()
+                        self._bind_content_interactions()
+                    return
+
+            if not self._overlay_usable:
+                return
+
+            if not overlay.winfo_ismapped():
+                overlay.deiconify()
             self._repair_zorder_if_needed()
         except tk.TclError:
             pass
@@ -984,6 +1083,7 @@ class GoldWidgetApp:
             pady=WINDOW_PADDING_Y,
         )
         container.pack(fill="both", expand=True)
+        self._content_container = container
 
         content = tk.Frame(container, bg=TRANSPARENT_COLOR)
         content.pack()
@@ -1099,9 +1199,10 @@ class GoldWidgetApp:
         new_y = event.y_root - self.drag_start_y
         self.root.geometry(f"+{new_x}+{new_y}")
         overlay = self.hit_overlay
-        if overlay is not None:
+        if overlay is not None and self._overlay_usable:
             try:
-                overlay.geometry(f"+{new_x}+{new_y}")
+                width, height = _measure_toplevel_size(self.root)
+                overlay.geometry(f"{width}x{height}+{new_x}+{new_y}")
             except tk.TclError:
                 pass
         self._repair_zorder_if_needed()
